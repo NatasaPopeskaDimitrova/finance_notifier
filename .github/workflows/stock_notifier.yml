@@ -1,0 +1,183 @@
+# 1. Trigger (alle 30 Min / manuell).
+
+# 2. Frisches Ubuntu-System startet.
+
+# 3. Repo wird ausgecheckt.
+
+# 4. Python 3.11 wird installiert, Pip-Cache aktiv.
+
+# 5. Dependencies aus requirements.txt.
+
+# 6. (Optional) State-Datei aus Cache wiederherstellen.
+
+# 7. python main.py starten (mit ENV-Variablen).
+
+# 8. Logs/State als Artefakt hochladen.
+
+
+
+### 1) Kopf: Name & Auslöser
+
+name: Stock Notifier #Der Workflow heißt „Stock Notifier“. So erscheint er im Actions-Tab.
+
+on:
+  schedule:               #Startet den Workflow alle 30 Minuten
+    # alle 30 Minuten (UTC)
+    - cron: "*/30 * * * *" 
+  workflow_dispatch:      #Du kannst den Workflow manuell im Actions-Tab starten
+    inputs:
+      run_mode:
+        description: "Modus"
+        type: choice
+        default: "main"
+        options: ["main", "run_once"]
+      extra_tickers:
+        description: "Ticker-Overrides (AAPL,MSFT)"
+        required: false
+        type: string
+
+###  2) Rechte
+permissions:
+  contents: read
+
+concurrency:
+  group: stock-notifier
+  cancel-in-progress: false
+
+### 3) Job-Definition
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}
+      NTFY_SERVER: https://ntfy.sh
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }} # in Repo-Secrets setzen
+      STATE_FILE: state.json                 # >>> Einheitlicher Name
+      LOG_LEVEL: INFO
+### 4) Schritte (Steps)
+## a) Code auschecken
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+## b) Python einrichten
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+## c) Dependencies installieren
+      - name: Install dependencies #Installiert Pakete aus requirements.txt (z. B. yfinance, requests, …).
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+## d) State-Datei wiederherstellen (Cache)
+      # Persistente State-Datei zwischen Runs
+      - name: Restore state.json #Versucht, die Datei alert_state.json aus dem GitHub-Cache zu holen 
+                                 #(damit dein Tool zwischen Läufen „Erinnerungen/Zustand“ behalten kann).
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STATE_FILE }}
+          key: state-${{ hashFiles('config.json') }} #welcher Cache benutzt wird
+          restore-keys: |
+            state-
+
+      # config.json bereitstellen/patchen (Secrets/Inputs eintragen)
+      - name: Prepare config.json
+        run: |
+          set -e
+          if [ ! -f config.json ]; then
+            cat > config.json <<'JSON'
+            {
+              "log": {
+                "level": "INFO",
+                "to_file": true,
+                "file_path": "alerts.log",
+                "file_max_bytes": 1000000,
+                "file_backup_count": 3
+              },
+              "tickers": ["AAPL"],
+              "threshold_pct": 2.5,
+              "ntfy": { "server": "https://ntfy.sh", "topic": "" },
+              "state_file": "state.json",
+              "market_hours": {
+                "timezone": "America/New_York",
+                "open": "09:30",
+                "close": "16:00",
+                "weekdays_only": true
+              },
+              "test": { "enabled": false },
+              "news": { "enabled": false }
+            }
+JSON
+          fi
+#____________________________________Inline-Python-Script.
+## e) App starten
+          python - <<'PY'
+          import json, os
+          p = "config.json"
+          with open(p, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
+          # Secrets aus Env in config übernehmen (falls gesetzt)
+          server = os.getenv("NTFY_SERVER")
+          topic  = os.getenv("NTFY_TOPIC")
+          if server: cfg.setdefault("ntfy", {})["server"] = server
+          if topic:  cfg.setdefault("ntfy", {})["topic"]  = topic
+
+          # Einheitliche State-Datei
+          cfg["state_file"] = os.getenv("STATE_FILE", "state.json")
+
+          # Optional: Ticker-Overrides aus workflow_dispatch
+          extra = os.getenv("INPUT_EXTRA_TICKERS", "").strip()
+          if extra:
+            cfg["tickers"] = [t.strip() for t in extra.replace(";", ",").split(",") if t.strip()]
+
+          # Log-Level via Env überschreiben
+          lvl = os.getenv("LOG_LEVEL")
+          if lvl:
+            cfg.setdefault("log", {})["level"] = lvl
+
+          with open(p, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+          print("Final config:", json.dumps(cfg, ensure_ascii=False))
+          PY
+#-----------------------------------------------
+      - name: Run notifier
+        run: |
+          set -e
+          if [ "${{ inputs.run_mode || 'main' }}" = "run_once" ]; then
+            python - <<'PY'
+            from pathlib import Path
+            import json
+            from src.app.core import run_once
+            cfg = json.load(open("config.json", encoding="utf-8"))
+            run_once(
+              tickers=cfg["tickers"],
+              threshold_pct=float(cfg["threshold_pct"]),
+              ntfy_server=cfg["ntfy"]["server"],
+              ntfy_topic=cfg["ntfy"]["topic"],
+              state_file=Path(cfg["state_file"]),
+              market_hours_cfg=cfg.get("market_hours", {}),
+              test_cfg=cfg.get("test", {}),
+              news_cfg=cfg.get("news", {}),
+            )
+            PY
+          else
+            python -m src.app.main
+          fi
+## f) Artefakte hochladen (Logs/State)
+      - name: Upload logs & state (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-${{ github.run_id }}
+          path: |
+            alerts.log
+            ${{ env.STATE_FILE }}
+            src/app/company_cache.json
+          if-no-files-found: ignore
