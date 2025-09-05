@@ -112,9 +112,7 @@ jobs:
               },
               "test": { "enabled": false },
               "news": { "enabled": false }
-            }
-
-        
+            }      
 #____________________________________##### Inline-Python-Script ###########
 
 ## e) App starten
