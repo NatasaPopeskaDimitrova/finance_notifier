@@ -113,10 +113,13 @@ jobs:
               "test": { "enabled": false },
               "news": { "enabled": false }
             }
-JSON
-          fi
-#____________________________________Inline-Python-Script.
+
+        
+#____________________________________##### Inline-Python-Script ###########
+
 ## e) App starten
+      - name: Prepare config.json
+        run: |
           python - <<'PY'
           import json, os
           p = "config.json"
